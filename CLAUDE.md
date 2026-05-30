@@ -6,18 +6,23 @@ or hooks** — the entire payload is one `lspServers` declaration.
 
 ## Layout
 
+This mirrors the official `claude-plugins-official` LSP plugins exactly (a marketplace with
+a `plugins/` subdirectory), which is what makes `lspServers` actually load.
+
 - `.claude-plugin/marketplace.json` — **load-bearing.** The `plugins[0].lspServers` block
-  is what makes the plugin do anything. The marketplace name, the single plugin name, and
-  the repo name are all `lean-lsp-plugin`; the plugin's `source` is `"./"` (repo root).
-- `.claude-plugin/plugin.json` — metadata only (name, version, author, license, keywords).
-  It must **not** contain `lspServers`; that key is only honored in `marketplace.json`.
-- `README.md` — user-facing install and usage.
-- `AGENTS.md` — symlink to this file.
+  is what makes the plugin do anything. All metadata (version, author, category) lives in
+  this entry. `source` points at the subdirectory `./plugins/lean-lsp-plugin`.
+- `plugins/lean-lsp-plugin/` — the plugin directory: `README.md` + `LICENSE` only. **No
+  `plugin.json`** (matches the official LSP plugins; metadata is in the marketplace entry).
+- Root `README.md`, `LICENSE`, `CLAUDE.md` — repo-level docs. `AGENTS.md` symlinks here.
 
 ## Rules
 
-- `lspServers` lives only in `marketplace.json`. Do not move or duplicate it into
-  `plugin.json` — it will not take effect there.
+- **`source` must point at the subdirectory, not `"./"`.** With a root source, `lspServers`
+  is not registered at runtime (the LSP tool reports "No LSP server available for .lean").
+  Every official LSP plugin uses a `./plugins/<name>` subdirectory source; match that.
+- `lspServers` lives only in `marketplace.json`, in the plugin entry. There is no
+  `plugin.json`; do not add one carrying `lspServers` — that key is ignored there.
 - Keep the `lspServers` config to the fields Claude Code supports: `command`, `args`,
   `extensionToLanguage`, `startupTimeout`. Other keys (`env`, `rootDir`, `rootMarkers`,
   `initializationOptions`) are not recognized.
