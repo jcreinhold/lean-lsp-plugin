@@ -9,7 +9,7 @@
     {
       "name": "lean-lsp-plugin",
       "description": "Native Lean 4 LSP for Claude Code: hover, go-to-definition, diagnostics, and symbols on .lean files via `lake serve`.",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "author": {
         "name": "Jacob Reinhold",
         "email": "5241441+jcreinhold@users.noreply.github.com"
@@ -19,8 +19,8 @@
       "strict": false,
       "lspServers": {
         "lean": {
-          "command": "lake",
-          "args": ["serve"],
+          "command": "${CLAUDE_PLUGIN_ROOT}/bin/lean-lsp-supervisor",
+          "args": [],
           "extensionToLanguage": { ".lean": "lean" },
           "startupTimeout": 120000
         }

@@ -1,0 +1,192 @@
+#!/bin/sh
+# lean-lsp-supervisor — run `lake serve` and keep its `lean --worker` subtree bounded.
+#
+# Copyright (c) 2026 Jacob Reinhold. MIT License.
+#
+# THE PROBLEM
+#   Lean's LSP server forks one `lean --worker` process per open document and only
+#   drops it when the editor sends an LSP `didClose`, the file header changes, or
+#   the worker crashes — there is no idle eviction and no cap. Claude Code's LSP
+#   client does not send `didClose`, so idle workers pile up; on a cold/red mathlib
+#   build each re-elaborates from source at ~2 GB, and dozens have reached ~100 GB.
+#
+# WHAT THIS DOES (it is a drop-in for `lake serve`)
+#   1. Caps each worker's memory with `-M`, which the server forwards to every
+#      worker, so one runaway file fails with a memory error instead of OOMing.
+#   2. Every so often, kills workers in ITS OWN process subtree that have done no
+#      work for a while. Killing an idle worker is safe: the server treats it as a
+#      crash and respawns it lazily only if that file is queried again.
+#   3. On shutdown, kills its whole subtree so nothing is left orphaned.
+#
+# THE PROCESS TREE it manages (everything below this script):
+#   lean-lsp-supervisor (this) -> lake serve -> lean --server -> lean --worker (xN)
+#
+# STDIO IS SACRED
+#   stdin/stdout/stderr ARE the LSP byte stream. This script never reads, writes,
+#   or buffers them; `lake serve` inherits them untouched. The only file it writes
+#   is its private idle-tracking state under $TMPDIR.
+#
+# POSIX sh only (macOS ships bash 3.2): no `local`, no arrays, no `[[`, no `<(…)`.
+#
+# The functions below are sourced by the test suite (see test/run.sh); the launch
+# at the bottom runs only when this file is executed, not sourced.
+
+set -u
+
+# --- policy: env-overridable, conservative defaults ------------------------------
+WORKER_MAX_MB="${LEAN_LSP_WORKER_MAX_MB:-4096}"         # -> lean --worker -M
+WORKER_JOBS="${LEAN_LSP_WORKER_JOBS:-}"                 # -> -j (omitted if empty)
+REAP_IDLE_SECS="${LEAN_LSP_REAP_IDLE_SECS:-300}"        # kill a worker idle this long
+REAP_INTERVAL_SECS="${LEAN_LSP_REAP_INTERVAL_SECS:-60}" # seconds between reaper passes
+REAP_DISABLE="${LEAN_LSP_REAP_DISABLE:-0}"              # 1 = no idle reaping
+
+LAKE_PID=""   # PID of our `lake serve` child; root of the subtree we own
+REAPER_PID="" # PID of the background reaper loop
+
+# Idle state, one line per worker: "<pid> <cpu-time-string> <idle-tick-count>".
+# Named by $$ so parallel supervisors never collide; removed on exit.
+STATE_FILE="${TMPDIR:-/tmp}/lean-lsp-sup.$$.state"
+
+# A process snapshot ("PID PPID …" lines), refreshed at the start of each pass and
+# read by the helpers below. Set before any helper that consults it.
+SNAPSHOT=""
+
+# Parent PID of $1, per the current $SNAPSHOT (empty if not found).
+parent_of() {
+	printf '%s\n' "$SNAPSHOT" | awk -v pid="$1" '$1 == pid { print $2; exit }'
+}
+
+# Succeeds if process $1 is somewhere beneath our `lake serve` (LAKE_PID). Walks up
+# the parent chain — clearer and cheaper than enumerating all descendants downward.
+in_our_subtree() {
+	cur="$1"
+	while [ -n "$cur" ] && [ "$cur" -gt 1 ] 2>/dev/null; do
+		[ "$cur" = "$LAKE_PID" ] && return 0
+		cur=$(parent_of "$cur")
+	done
+	return 1
+}
+
+# Send signal $1 to every process in our subtree, then to `lake serve` itself.
+# shellcheck disable=SC2329  # invoked from shutdown() via EXIT/TERM/INT traps
+signal_subtree() {
+	[ -n "$LAKE_PID" ] || return 0
+	SNAPSHOT=$(ps -o pid,ppid -ax 2>/dev/null)
+	printf '%s\n' "$SNAPSHOT" | awk 'NR > 1 { print $1 }' | while read -r p; do
+		[ "$p" = "$LAKE_PID" ] && continue
+		in_our_subtree "$p" && kill -"$1" "$p" 2>/dev/null
+	done
+	kill -"$1" "$LAKE_PID" 2>/dev/null
+}
+
+# Idempotent shutdown: stop the reaper, TERM the subtree, brief grace, then KILL.
+# shellcheck disable=SC2329  # invoked from EXIT/TERM/INT traps
+shutdown() {
+	[ -n "$REAPER_PID" ] && kill "$REAPER_PID" 2>/dev/null
+	REAPER_PID=""
+	signal_subtree TERM
+	sleep 2
+	signal_subtree KILL
+	rm -f "$STATE_FILE"
+}
+
+# The idle-tick count recorded for worker $1 last pass (empty if we've not seen it).
+idle_ticks_of() {
+	awk -v pid="$1" '$1 == pid { print $3; exit }' "$STATE_FILE" 2>/dev/null
+}
+
+# The CPU-time string recorded for worker $1 last pass (empty if we've not seen it).
+# We compare this string for equality across passes; a worker doing work advances
+# its CPU time, so an unchanged string means "did nothing since last pass". That is
+# all the idle signal we need — no need to parse it into seconds.
+prev_cputime_of() {
+	awk -v pid="$1" '$1 == pid { print $2; exit }' "$STATE_FILE" 2>/dev/null
+}
+
+# idle_ticks_next <prev_cputime> <cur_cputime> <prev_ticks> -> new idle-tick count.
+# Resets to 0 when CPU time changed (the worker did work, is new, or its PID was
+# reused — all safe to keep); otherwise increments. Pure; unit-tested.
+idle_ticks_next() {
+	if [ "$2" = "$1" ]; then echo $(($3 + 1)); else echo 0; fi
+}
+
+# reap_due <idle-ticks> — true once that many idle passes reaches REAP_IDLE_SECS.
+reap_due() {
+	[ "$(($1 * REAP_INTERVAL_SECS))" -ge "$REAP_IDLE_SECS" ]
+}
+
+# One reaper pass: reap idle `lean --worker` processes that belong to us.
+reap_idle_workers() {
+	SNAPSHOT=$(ps -o pid,ppid,time,args -axww 2>/dev/null)
+	[ -n "$SNAPSHOT" ] || return 0
+
+	# Rebuild the state file from scratch each pass; survivors get re-recorded.
+	next_state="${STATE_FILE}.next"
+	: >"$next_state"
+
+	# Walk only worker lines. `--` keeps grep from reading `--worker` as a flag.
+	# This `while` runs in a subshell (it's in a pipeline), so we persist state by
+	# writing to $next_state rather than to shell variables.
+	printf '%s\n' "$SNAPSHOT" | grep -- '--worker' | while read -r pid _ppid cputime _rest; do
+		in_our_subtree "$pid" || continue
+
+		prev_ticks=$(idle_ticks_of "$pid")
+		ticks=$(idle_ticks_next "$(prev_cputime_of "$pid")" "$cputime" "${prev_ticks:-0}")
+
+		if reap_due "$ticks"; then
+			kill -TERM "$pid" 2>/dev/null # server sees a crash; respawns lazily
+		else
+			printf '%s %s %s\n' "$pid" "$cputime" "$ticks" >>"$next_state"
+		fi
+	done
+
+	mv -f "$next_state" "$STATE_FILE"
+}
+
+# Launch `lake serve` and supervise it. Kept in a function so the test suite can
+# source the helpers above without starting a server (see the guard at the bottom).
+main() {
+	trap 'shutdown; exit 0' TERM INT
+	trap 'shutdown' EXIT
+
+	# Launch in the background (so this script stays alive to reap and to handle
+	# signals via the interruptible `wait` below), inheriting our stdio.
+	#
+	# `<&0` is load-bearing: a POSIX shell redirects a backgrounded command's stdin
+	# to /dev/null when job control is off — which it is in this non-interactive
+	# script — so without `<&0`, `lake serve` would read EOF and exit at once. `<&0`
+	# reconnects its stdin to ours (the LSP stream). stdout/stderr are inherited.
+	if [ -n "$WORKER_JOBS" ]; then
+		lake serve -- -M "$WORKER_MAX_MB" -j "$WORKER_JOBS" <&0 &
+	else
+		lake serve -- -M "$WORKER_MAX_MB" <&0 &
+	fi
+	LAKE_PID=$!
+
+	# Start the reaper unless disabled. (`-M` and the shutdown sweep apply regardless.)
+	if [ "$REAP_DISABLE" = "0" ] && [ "$REAP_IDLE_SECS" -gt 0 ] 2>/dev/null; then
+		: >"$STATE_FILE"
+		(
+			while sleep "$REAP_INTERVAL_SECS"; do
+				kill -0 "$LAKE_PID" 2>/dev/null || break # lake serve gone -> stop
+				reap_idle_workers
+			done
+		) &
+		REAPER_PID=$!
+	fi
+
+	# Block until `lake serve` exits (incl. when Claude Code closes our stdin). The
+	# TERM/INT traps interrupt this `wait` to run shutdown.
+	wait "$LAKE_PID"
+}
+
+# Run unless sourced by the test suite, which sets this to load functions only.
+# When sourced (NOMAIN=1) we fall off the end and return from `.`; when executed we
+# run main and exit with its status.
+case "${LEAN_LSP_SUPERVISOR_NOMAIN:-0}" in
+1) : ;;
+*)
+	main
+	exit $?
+	;;
+esac
