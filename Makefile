@@ -1,5 +1,5 @@
 # lean-lsp-plugin — developer tasks.
-SH_FILES := bin/lean-lsp-supervisor test/run.sh
+SH_FILES := plugins/lean-lsp-plugin/bin/lean-lsp-supervisor test/run.sh
 
 .PHONY: help test test-unit test-integration lint fmt validate
 

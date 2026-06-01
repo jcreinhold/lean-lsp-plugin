@@ -16,7 +16,11 @@ set -u
 
 here=$(cd -- "$(dirname -- "$0")" && pwd)
 repo=$(dirname -- "$here")
-sup="$repo/bin/lean-lsp-supervisor"
+# CLAUDE_PLUGIN_ROOT is the installed copy of the plugin's `source` dir
+# (plugins/lean-lsp-plugin), so the supervisor lives under that subtree, not the
+# repo root. Mirror that here so the test exercises the real layout.
+plugin_root="$repo/plugins/lean-lsp-plugin"
+sup="$plugin_root/bin/lean-lsp-supervisor"
 
 pass=0
 fail=0
@@ -91,7 +95,7 @@ integration() {
 		echo "ok   - SKIP integration: python3 not found"
 		return 0
 	fi
-	if CLAUDE_PLUGIN_ROOT="$repo" python3 "$here/lsp_smoke.py"; then
+	if CLAUDE_PLUGIN_ROOT="$plugin_root" python3 "$here/lsp_smoke.py"; then
 		ok "integration smoke test"
 	else
 		no "integration smoke test"

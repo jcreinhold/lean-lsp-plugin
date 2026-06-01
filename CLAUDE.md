@@ -12,10 +12,13 @@ which is what makes `lspServers` actually load.
 - `.claude-plugin/marketplace.json` — **load-bearing.** The `plugins[0].lspServers` block is what makes the plugin do
   anything. All metadata (version, author, category) lives in this entry. `source` points at the subdirectory
   `./plugins/lean-lsp-plugin`.
-- `plugins/lean-lsp-plugin/` — the plugin directory: `README.md` + `LICENSE` only. **No `plugin.json`** (matches the
-  official LSP plugins; metadata is in the marketplace entry).
-- `bin/lean-lsp-supervisor` — the LSP `command`. Runs `lake serve` and keeps its `lean --worker` subtree bounded
-  (per-worker `-M` cap, idle reaping, shutdown sweep). POSIX `sh`; see its header for the why.
+- `plugins/lean-lsp-plugin/` — the plugin directory (the `source` subtree, copied verbatim into the plugin cache, so
+  `CLAUDE_PLUGIN_ROOT` resolves here): `README.md`, `LICENSE`, and `bin/`. **No `plugin.json`** (matches the official LSP
+  plugins; metadata is in the marketplace entry).
+- `plugins/lean-lsp-plugin/bin/lean-lsp-supervisor` — the LSP `command`. **Must live under the `source` subtree** —
+  `${CLAUDE_PLUGIN_ROOT}` is the cached copy of that subtree, so a supervisor at the repo root is never bundled and the
+  LSP fails with `ENOENT ... posix_spawn '.../bin/lean-lsp-supervisor'`. Runs `lake serve` and keeps its `lean --worker`
+  subtree bounded (per-worker `-M` cap, idle reaping, shutdown sweep). POSIX `sh`; see its header for the why.
 - `docs/upstream-didclose-issue.md` — drafted bug report for the root-cause client gap (no `didClose`).
 - `Makefile` + `test/` — dev tasks and the test suite. `test/run.sh` has pure-`sh` unit tests (it sources the supervisor
   with `LEAN_LSP_SUPERVISOR_NOMAIN=1` to load its functions without launching a server) and a `lake`+ `python3`-gated
